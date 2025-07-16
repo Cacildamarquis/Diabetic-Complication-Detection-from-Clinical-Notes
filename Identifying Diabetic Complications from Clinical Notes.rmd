@@ -1,0 +1,110 @@
+library(tidyverse)
+library(magrittr)
+library(bigrquery)
+library(stringr)
+library(DBI)
+
+con <-DBI::dbConnect(drv = bigquery(), 
+project = "learnclinicaldatascience", dataset="course4_data", billing = "learnclinicaldatascience")
+
+diabetes_notes <- tbl(con,"diabetes_notes")
+gold_std <- tbl(con,"diabetes_goldstandard")
+
+db_notes <- diabetes_notes %>% collect()
+gold_notes <- gold_std %>% collect()
+
+#funcion
+all_headers <- db_notes %>%
+  mutate(lines = str_split(TEXT, "\n")) %>%
+  unnest(lines) %>%
+  mutate(upper_line = str_trim(str_to_upper(lines))) %>%
+  filter(str_detect(upper_line, "^([A-Z /]+):")) %>%
+  count(upper_line, sort = TRUE)
+
+all_headers
+
+extract_text_window <- function(text, keyword, window_size = 50) {
+  words <- str_split(text, "\\s+")[[1]]
+  match_idx <- which(str_detect(words, regex(keyword, ignore_case = TRUE)))
+  if (length(match_idx) == 0) return("")
+    windows <- lapply(match_idx, function(i) {
+    start <- max(1, i - window_size)
+    end <- min(length(words), i + window_size)
+    paste(words[start:end], collapse = " ")
+  })
+  paste(unlist(windows), collapse = " || ")
+}
+
+
+notes <- notes %>%
+  mutate(
+    neuropathy_context = map_chr(TEXT, extract_text_window, keyword = "neuropathy", window_size = 20),
+    nephropathy_context = map_chr(TEXT, extract_text_window, keyword = "nephropathy", window_size = 20),
+    retinopathy_context = map_chr(TEXT, extract_text_window, keyword = "retinopathy", window_size = 20)
+  )
+
+#negation pattern
+negation_pattern <- regex(
+  "\\b(no|denies|not|without|free of|negative for|resolved|rule[ds]? out|never had| absence of)\\b.{0,50}\\b(neuropathy|nephropathy|retinopathy|nerve pain|kidney disease|vision loss)\\b", ignore_case= TRUE)
+
+#Regex for complications
+neuropathy_pattern <- regex("neuropathy|nerve (pain|damage)|peripheral neuropathy|diabetic neuropathy|numbness|tingling|burning (pain|sensation)|pins and needles|loss of sensation", 
+                            ignore_case= TRUE)
+nephropathy_pattern <- regex("nephropathy|diabetic nephropathy|kidney (disease|damage|failure)|proteinuria|renal (failure|dysfunction|disease)|albuminuria|creatinine elevation",
+                             ignore_case= TRUE)
+retinopathy_pattern <- regex("retinopathy|diabetic retinopathy|diabetic eye disease|retinal (damage|hemorrhage|changes)|vision (loss|blurred|blurry)|macular (edema|degeneration)|fundus changes|background retinopathy",
+                             ignore_case= TRUE)
+
+#Classifying complications
+classified <- db_notes %>%
+  mutate(neuropathy_flag= if_else(str_detect(TEXT,neuropathy_pattern)&
+                                   !str_detect(TEXT,negation_pattern),
+                                 1,0),
+        nephropathy_flag= if_else(str_detect(TEXT,nephropathy_pattern)&
+                                    !str_detect(TEXT,negation_pattern),
+                                  1,0), 
+        retinopathy_flag= if_else(str_detect(TEXT,retinopathy_pattern)&
+                                    !str_detect(TEXT,negation_pattern),
+                                  1,0) )
+classified %>%
+  summarise(
+    neuropathy_detected = sum(neuropathy_flag),
+    nephropathy_detected = sum(nephropathy_flag),
+    retinopathy_detected = sum(retinopathy_flag)
+  )
+#Joining gold standard
+final<- classified %>%
+  inner_join(gold_notes, by="NOTE_ID") %>%
+  select(NOTE_ID,neuropathy_flag,nephropathy_flag,retinopathy_flag, 
+         gold_neuropathy=DIABETIC_NEUROPATHY,
+         gold_nephropathy=DIABETIC_NEPHROPATHY, 
+         gold_retinopathy=DIABETIC_RETINOPATHY)
+
+#Evaluating performance per complication
+compute_metrics <- function(predicted, actual) {
+  cm <- table(Predicted= predicted, Actual= actual)
+  
+  TP <- ifelse("1" %in% rownames(cm) && "1" %in% colnames(cm), cm["1", "1"], 0)
+  TN <- ifelse("0" %in% rownames(cm) && "0" %in% colnames(cm), cm["0", "0"], 0)
+  FP <- ifelse("1" %in% rownames(cm) && "0" %in% colnames(cm), cm["1", "0"], 0)
+  FN <- ifelse("0" %in% rownames(cm) && "1" %in% colnames(cm), cm["0", "1"], 0)
+  
+  accuracy <- (TP + TN) / sum(cm)
+  precision <- ifelse((TP+FP) >0, TP/(TP+FP), NA)
+  recall <- ifelse((TP+FN) >0, TP/(TP+FN), NA)
+  f1 <- ifelse(!is.na(precision)&& !is.na(recall) && (precision+ recall)>0,
+               2*(precision*recall)/(precision+ recall), NA)
+  list(confusion_matrix=cm,
+       accuracy=accuracy, precision=precision, recall=recall, f1=f1)
+}
+
+#Metrix for each complication
+neuropathy_results <- compute_metrics(final$neuropathy_flag,final$gold_neuropathy)
+nephropathy_results <- compute_metrics(final$nephropathy_flag,final$gold_nephropathy)
+retinopathy_results <- compute_metrics(final$retinopathy_flag,final$gold_retinopathy)
+
+#Results
+neuropathy_results
+nephropathy_results
+retinopathy_results
+
